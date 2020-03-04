@@ -39,6 +39,8 @@ endif()
 
 find_package(rmw REQUIRED)
 find_package(rosidl_generator_c REQUIRED)
+find_package(rosidl_runtime_c REQUIRED)
+find_package(rosidl_runtime_cpp REQUIRED)
 find_package(rosidl_typesupport_introspection_c REQUIRED)
 find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 
@@ -72,6 +74,8 @@ ament_target_dependencies(rmw_cyclonedds_cpp
   "rosidl_typesupport_introspection_cpp"
   "rmw"
   "rosidl_generator_c"
+  "rosidl_runtime_c"
+  "rosidl_runtime_cpp"
 )
 
 configure_rmw_library(rmw_cyclonedds_cpp)
