@@ -37,14 +37,20 @@ if(NOT CycloneDDS_FOUND)
   return()
 endif()
 
+if("$ENV{ROS_DISTRO}" STRLESS "foxy")
+  set(rosidl_runtime_pkgs rosidl_generator_c)
+else()
+  set(rosidl_runtime_pkgs rosidl_runtime_c)
+endif()
+
 find_package(rmw REQUIRED)
-find_package(rosidl_runtime_c REQUIRED)
+find_package(${rosidl_runtime_pkgs} REQUIRED)
 find_package(rosidl_typesupport_introspection_c REQUIRED)
 find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 
 ament_export_dependencies(rcutils)
 ament_export_dependencies(rmw)
-ament_export_dependencies(rosidl_runtime_c)
+ament_export_dependencies(${rosidl_runtime_pkgs})
 ament_export_dependencies(rosidl_typesupport_introspection_c)
 ament_export_dependencies(rosidl_typesupport_introspection_cpp)
 
@@ -71,7 +77,7 @@ ament_target_dependencies(rmw_cyclonedds_cpp
   "rosidl_typesupport_introspection_c"
   "rosidl_typesupport_introspection_cpp"
   "rmw"
-  "rosidl_runtime_c"
+  ${rosidl_runtime_pkgs}
 )
 
 configure_rmw_library(rmw_cyclonedds_cpp)
