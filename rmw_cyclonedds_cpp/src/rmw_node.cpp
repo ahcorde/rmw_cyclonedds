@@ -23,6 +23,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <regex>
 
@@ -33,14 +34,14 @@
 #include "rmw/allocators.h"
 #include "rmw/convert_rcutils_ret_to_rmw_ret.h"
 #include "rmw/error_handling.h"
-#include "rmw/names_and_types.h"
+#include "rmw/event.h"
+#include "rmw/get_node_info_and_types.h"
 #include "rmw/get_service_names_and_types.h"
 #include "rmw/get_topic_names_and_types.h"
-#include "rmw/get_node_info_and_types.h"
-#include "rmw/event.h"
-#include "rmw/validate_node_name.h"
+#include "rmw/names_and_types.h"
 #include "rmw/rmw.h"
 #include "rmw/sanity_checks.h"
+#include "rmw/validate_node_name.h"
 
 #include "Serialization.hpp"
 #include "rmw/impl/cpp/macros.hpp"
@@ -53,6 +54,7 @@
 
 #if RMW_VERSION_GTE(0, 8, 2)
 #include "rmw/get_topic_endpoint_info.h"
+#include "rmw/incompatible_qos_events_statuses.h"
 #include "rmw/topic_endpoint_info_array.h"
 #endif
 
@@ -165,7 +167,6 @@ struct CddsPublisher : CddsEntity
 struct CddsSubscription : CddsEntity
 {
   dds_entity_t rdcondh;
-  struct ddsi_sertopic * sertopic;
 };
 
 struct CddsCS
@@ -358,6 +359,12 @@ extern "C" rmw_ret_t rmw_init_options_init(
   init_options->implementation_identifier = eclipse_cyclonedds_identifier;
   init_options->allocator = allocator;
   init_options->impl = nullptr;
+#if RMW_VERSION_GTE(0, 8, 2)
+  init_options->localhost_only = RMW_LOCALHOST_ONLY_DEFAULT;
+  init_options->domain_id = RMW_DEFAULT_DOMAIN_ID;
+  init_options->security_context = NULL;
+  init_options->security_options = rmw_get_zero_initialized_security_options();
+#endif
   return RMW_RET_OK;
 }
 
@@ -374,19 +381,44 @@ extern "C" rmw_ret_t rmw_init_options_copy(const rmw_init_options_t * src, rmw_i
     RMW_SET_ERROR_MSG("expected zero-initialized dst");
     return RMW_RET_INVALID_ARGUMENT;
   }
+#if RMW_VERSION_GTE(0, 8, 2)
+  const rcutils_allocator_t * allocator = &src->allocator;
+  rmw_ret_t ret = RMW_RET_OK;
+
+  allocator->deallocate(dst->security_context, allocator->state);
+  *dst = *src;
+  dst->security_context = NULL;
+  dst->security_options = rmw_get_zero_initialized_security_options();
+
+  dst->security_context = rcutils_strdup(src->security_context, *allocator);
+  if (src->security_context && !dst->security_context) {
+    ret = RMW_RET_BAD_ALLOC;
+    goto fail;
+  }
+  return rmw_security_options_copy(&src->security_options, allocator, &dst->security_options);
+fail:
+  allocator->deallocate(dst->security_context, allocator->state);
+  return ret;
+#else
   *dst = *src;
   return RMW_RET_OK;
+#endif
 }
 
 extern "C" rmw_ret_t rmw_init_options_fini(rmw_init_options_t * init_options)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(init_options, RMW_RET_INVALID_ARGUMENT);
-  RCUTILS_CHECK_ALLOCATOR(&init_options->allocator, return RMW_RET_INVALID_ARGUMENT);
+  rcutils_allocator_t & allocator = init_options->allocator;
+  RCUTILS_CHECK_ALLOCATOR(&allocator, return RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
     init_options,
     init_options->implementation_identifier,
     eclipse_cyclonedds_identifier,
     return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+#if RMW_VERSION_GTE(0, 8, 2)
+  allocator.deallocate(init_options->security_context, allocator.state);
+  rmw_security_options_fini(&init_options->security_options, &allocator);
+#endif
   *init_options = rmw_get_zero_initialized_init_options();
   return RMW_RET_OK;
 }
@@ -405,7 +437,11 @@ extern "C" rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t 
   context->instance_id = options->instance_id;
   context->implementation_identifier = eclipse_cyclonedds_identifier;
   context->impl = nullptr;
+#if RMW_VERSION_GTE(0, 8, 2)
+  return rmw_init_options_copy(options, &context->options);
+#else
   return RMW_RET_OK;
+#endif
 }
 
 extern "C" rmw_ret_t rmw_node_assert_liveliness(const rmw_node_t * node)
@@ -636,23 +672,39 @@ static void node_gone_from_domain_locked(dds_domainid_t did)
 }
 #endif
 
-static std::string get_node_user_data(const char * node_name, const char * node_namespace)
+static std::string get_node_user_data_name_ns(const char * node_name, const char * node_namespace)
 {
   return std::string("name=") + std::string(node_name) +
          std::string(";namespace=") + std::string(node_namespace) +
          std::string(";");
 }
 
+#if RMW_VERSION_GTE(0, 8, 2)
+static std::string get_node_user_data(
+  const char * node_name, const char * node_namespace, const char * security_context)
+{
+  return get_node_user_data_name_ns(node_name, node_namespace) +
+         std::string("securitycontext=") + std::string(security_context) +
+         std::string(";");
+}
+#else
+#define get_node_user_data get_node_user_data_name_ns
+#endif
+
 extern "C" rmw_node_t * rmw_create_node(
   rmw_context_t * context, const char * name,
-  const char * namespace_, size_t domain_id,
-  const rmw_node_security_options_t * security_options
+  const char * namespace_, size_t domain_id
+#if !RMW_VERSION_GTE(0, 8, 2)
+  , const rmw_node_security_options_t * security_options
+#endif
 #if RMW_VERSION_GTE(0, 8, 1)
   , bool localhost_only
 #endif
 )
 {
+#if !RMW_VERSION_GTE(0, 8, 2)
   static_cast<void>(context);
+#endif
   RET_NULL_X(name, return nullptr);
   RET_NULL_X(namespace_, return nullptr);
 #if MULTIDOMAIN
@@ -667,7 +719,9 @@ extern "C" rmw_node_t * rmw_create_node(
   static_cast<void>(domain_id);
   const dds_domainid_t did = DDS_DOMAIN_DEFAULT;
 #endif
+#if !RMW_VERSION_GTE(0, 8, 2)
   (void) security_options;
+#endif
   rmw_ret_t ret;
   int dummy_validation_result;
   size_t dummy_invalid_index;
@@ -689,7 +743,11 @@ extern "C" rmw_node_t * rmw_create_node(
 #endif
 
   dds_qos_t * qos = dds_create_qos();
+#if RMW_VERSION_GTE(0, 8, 2)
+  std::string user_data = get_node_user_data(name, namespace_, context->options.security_context);
+#else
   std::string user_data = get_node_user_data(name, namespace_);
+#endif
   dds_qset_userdata(qos, user_data.c_str(), user_data.size());
   dds_entity_t pp = dds_create_participant(did, qos, nullptr);
   dds_delete_qos(qos);
@@ -931,6 +989,63 @@ extern "C" rmw_ret_t rmw_deserialize(
 
 /////////////////////////////////////////////////////////////////////////////////////////
 ///////////                                                                   ///////////
+///////////    TOPIC CREATION                                                 ///////////
+///////////                                                                   ///////////
+/////////////////////////////////////////////////////////////////////////////////////////
+
+/* Publications need the sertopic that DDSI uses for the topic when publishing a
+   serialized message.  With the old ("arbitrary") interface of Cyclone, one doesn't know
+   the sertopic that is actually used because that may be the one that was provided in the
+   call to dds_create_topic_arbitrary(), but it may also be one that was introduced by a
+   preceding call to create the same topic.
+
+   There is no way of discovering which case it is, and there is no way of getting access
+   to the correct sertopic.  The best one can do is to keep using one provided when
+   creating the topic -- and fortunately using the wrong sertopic has surprisingly few
+   nasty side-effects, but it still wrong.
+
+   Because the caller retains ownership, so this is easy, but it does require dropping the
+   reference when cleaning up.
+
+   The new ("generic") interface instead takes over the ownership of the reference iff it
+   succeeds and it returns a non-counted reference to the sertopic actually used.  The
+   lifetime of the reference is at least as long as the lifetime of the DDS topic exists;
+   and the topic's lifetime is at least that of the readers/writers using it.  This
+   reference can therefore safely be used. */
+
+static dds_entity_t create_topic(
+  dds_entity_t pp, struct ddsi_sertopic * sertopic,
+  struct ddsi_sertopic ** stact)
+{
+  dds_entity_t tp;
+#ifdef DDS_HAS_CREATE_TOPIC_GENERIC
+  tp = dds_create_topic_generic(pp, &sertopic, nullptr, nullptr, nullptr);
+#else
+  tp = dds_create_topic_arbitrary(pp, sertopic, nullptr, nullptr, nullptr);
+#endif
+  if (tp < 0) {
+    ddsi_sertopic_unref(sertopic);
+  } else {
+    if (stact) {
+      *stact = sertopic;
+    }
+  }
+  return tp;
+}
+
+static dds_entity_t create_topic(dds_entity_t pp, struct ddsi_sertopic * sertopic)
+{
+  dds_entity_t tp = create_topic(pp, sertopic, nullptr);
+#ifndef DDS_HAS_CREATE_TOPIC_GENERIC
+  if (tp > 0) {
+    ddsi_sertopic_unref(sertopic);
+  }
+#endif
+  return tp;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////
+///////////                                                                   ///////////
 ///////////    PUBLICATIONS                                                   ///////////
 ///////////                                                                   ///////////
 /////////////////////////////////////////////////////////////////////////////////////////
@@ -1115,6 +1230,28 @@ static dds_qos_t * create_readwrite_qos(
   return qos;
 }
 
+#if RMW_VERSION_GTE(0, 8, 2)
+static rmw_qos_policy_kind_t dds_qos_policy_to_rmw_qos_policy(dds_qos_policy_id_t policy_id)
+{
+  switch (policy_id) {
+    case DDS_DURABILITY_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_DURABILITY;
+    case DDS_DEADLINE_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_DEADLINE;
+    case DDS_LIVELINESS_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_LIVELINESS;
+    case DDS_RELIABILITY_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_RELIABILITY;
+    case DDS_HISTORY_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_HISTORY;
+    case DDS_LIFESPAN_QOS_POLICY_ID:
+      return RMW_QOS_POLICY_LIFESPAN;
+    default:
+      return RMW_QOS_POLICY_INVALID;
+  }
+}
+#endif
+
 static bool dds_qos_to_rmw_qos(const dds_qos_t * dds_qos, rmw_qos_profile_t * qos_policies)
 {
   assert(dds_qos);
@@ -1263,9 +1400,9 @@ static CddsPublisher * create_cdds_publisher(
     fqtopic_name.c_str(), type_support->typesupport_identifier,
     create_message_type_support(type_support->data, type_support->typesupport_identifier), false,
     rmw_cyclonedds_cpp::make_message_value_type(type_supports));
-  if ((topic =
-    dds_create_topic_arbitrary(node_impl->enth, sertopic, nullptr, nullptr, nullptr)) < 0)
-  {
+  struct ddsi_sertopic * stact;
+  topic = create_topic(node_impl->enth, sertopic, &stact);
+  if (topic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_topic;
   }
@@ -1280,7 +1417,7 @@ static CddsPublisher * create_cdds_publisher(
     RMW_SET_ERROR_MSG("failed to get instance handle for writer");
     goto fail_instance_handle;
   }
-  pub->sertopic = sertopic;
+  pub->sertopic = stact;
   dds_delete_qos(qos);
   dds_delete(topic);
   return pub;
@@ -1293,6 +1430,9 @@ fail_writer:
   dds_delete_qos(qos);
 fail_qos:
   dds_delete(topic);
+#ifndef DDS_HAS_CREATE_TOPIC_GENERIC
+  ddsi_sertopic_unref(stact);
+#endif
 fail_topic:
   delete pub;
   return nullptr;
@@ -1448,7 +1588,9 @@ extern "C" rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * 
     if (dds_delete(pub->enth) < 0) {
       RMW_SET_ERROR_MSG("failed to delete writer");
     }
+#ifndef DDS_HAS_CREATE_TOPIC_GENERIC
     ddsi_sertopic_unref(pub->sertopic);
+#endif
     delete pub;
   }
   rmw_free(const_cast<char *>(publisher->topic_name));
@@ -1485,9 +1627,8 @@ static CddsSubscription * create_cdds_subscription(
     fqtopic_name.c_str(), type_support->typesupport_identifier,
     create_message_type_support(type_support->data, type_support->typesupport_identifier), false,
     rmw_cyclonedds_cpp::make_message_value_type(type_supports));
-  if ((topic =
-    dds_create_topic_arbitrary(node_impl->enth, sertopic, nullptr, nullptr, nullptr)) < 0)
-  {
+  topic = create_topic(node_impl->enth, sertopic);
+  if (topic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_topic;
   }
@@ -1502,7 +1643,6 @@ static CddsSubscription * create_cdds_subscription(
     RMW_SET_ERROR_MSG("failed to create readcondition");
     goto fail_readcond;
   }
-  sub->sertopic = sertopic;
   dds_delete_qos(qos);
   dds_delete(topic);
   return sub;
@@ -1633,7 +1773,6 @@ extern "C" rmw_ret_t rmw_destroy_subscription(rmw_node_t * node, rmw_subscriptio
     if (dds_delete(sub->enth) < 0) {
       RMW_SET_ERROR_MSG("failed to delete reader");
     }
-    ddsi_sertopic_unref(sub->sertopic);
     delete sub;
   }
   rmw_free(const_cast<char *>(subscription->topic_name));
@@ -1666,9 +1805,7 @@ static rmw_ret_t rmw_take_int(
       dds_time_t tnow = dds_time();
       dds_time_t dt = tnow - info.source_timestamp;
       if (dt >= DDS_MSECS(REPORT_LATE_MESSAGES)) {
-        fprintf(
-          stderr, "** %s sample in history for %.fms\n", sub->sertopic->name,
-          static_cast<double>(dt) / 1e6);
+        fprintf(stderr, "** sample in history for %.fms\n", static_cast<double>(dt) / 1e6);
       }
 #endif
       *taken = true;
@@ -1800,6 +1937,75 @@ extern "C" rmw_ret_t rmw_return_loaned_message_from_subscription(
   return RMW_RET_UNSUPPORTED;
 }
 
+/////////////////////////////////////////////////////////////////////////////////////////
+///////////                                                                   ///////////
+///////////    EVENTS                                                         ///////////
+///////////                                                                   ///////////
+/////////////////////////////////////////////////////////////////////////////////////////
+
+/// mapping of RMW_EVENT to the corresponding DDS status
+static const std::unordered_map<rmw_event_type_t, uint32_t> mask_map{
+  {RMW_EVENT_LIVELINESS_CHANGED, DDS_LIVELINESS_CHANGED_STATUS},
+  {RMW_EVENT_REQUESTED_DEADLINE_MISSED, DDS_REQUESTED_DEADLINE_MISSED_STATUS},
+  {RMW_EVENT_LIVELINESS_LOST, DDS_LIVELINESS_LOST_STATUS},
+  {RMW_EVENT_OFFERED_DEADLINE_MISSED, DDS_OFFERED_DEADLINE_MISSED_STATUS},
+#if RMW_VERSION_GTE(0, 8, 2)
+  {RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE, DDS_REQUESTED_INCOMPATIBLE_QOS_STATUS},
+  {RMW_EVENT_OFFERED_QOS_INCOMPATIBLE, DDS_OFFERED_INCOMPATIBLE_QOS_STATUS},
+#endif
+};
+
+static bool is_event_supported(const rmw_event_type_t event_t)
+{
+  return mask_map.count(event_t) == 1;
+}
+
+static uint32_t get_status_kind_from_rmw(const rmw_event_type_t event_t)
+{
+  return mask_map.at(event_t);
+}
+
+static rmw_ret_t init_rmw_event(
+  rmw_event_t * rmw_event, const char * topic_endpoint_impl_identifier, void * data,
+  rmw_event_type_t event_type)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(rmw_event, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(topic_endpoint_impl_identifier, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(data, RMW_RET_INVALID_ARGUMENT);
+  if (!is_event_supported(event_type)) {
+    RMW_SET_ERROR_MSG("provided event_type is not supported by rmw_cyclonedds_cpp");
+    return RMW_RET_UNSUPPORTED;
+  }
+
+  rmw_event->implementation_identifier = topic_endpoint_impl_identifier;
+  rmw_event->data = data;
+  rmw_event->event_type = event_type;
+
+  return RMW_RET_OK;
+}
+
+extern "C" rmw_ret_t rmw_publisher_event_init(
+  rmw_event_t * rmw_event, const rmw_publisher_t * publisher, rmw_event_type_t event_type)
+{
+  RET_WRONG_IMPLID_X(publisher, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  return init_rmw_event(
+    rmw_event,
+    publisher->implementation_identifier,
+    publisher->data,
+    event_type);
+}
+
+extern "C" rmw_ret_t rmw_subscription_event_init(
+  rmw_event_t * rmw_event, const rmw_subscription_t * subscription, rmw_event_type_t event_type)
+{
+  RET_WRONG_IMPLID_X(subscription, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  return init_rmw_event(
+    rmw_event,
+    subscription->implementation_identifier,
+    subscription->data,
+    event_type);
+}
+
 extern "C" rmw_ret_t rmw_take_event(
   const rmw_event_t * event_handle, void * event_info,
   bool * taken)
@@ -1840,6 +2046,25 @@ extern "C" rmw_ret_t rmw_take_event(
         }
       }
 
+#if RMW_VERSION_GTE(0, 8, 2)
+    case RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE: {
+        auto ei = static_cast<rmw_requested_qos_incompatible_event_status_t *>(event_info);
+        auto sub = static_cast<CddsSubscription *>(event_handle->data);
+        dds_requested_incompatible_qos_status_t st;
+        if (dds_get_requested_incompatible_qos_status(sub->enth, &st) < 0) {
+          *taken = false;
+          return RMW_RET_ERROR;
+        } else {
+          ei->total_count = static_cast<int32_t>(st.total_count);
+          ei->total_count_change = st.total_count_change;
+          ei->last_policy_kind = dds_qos_policy_to_rmw_qos_policy(
+            static_cast<dds_qos_policy_id_t>(st.last_policy_id));
+          *taken = true;
+          return RMW_RET_OK;
+        }
+      }
+#endif
+
     case RMW_EVENT_LIVELINESS_LOST: {
         auto ei = static_cast<rmw_liveliness_lost_status_t *>(event_info);
         auto pub = static_cast<CddsPublisher *>(event_handle->data);
@@ -1869,6 +2094,25 @@ extern "C" rmw_ret_t rmw_take_event(
           return RMW_RET_OK;
         }
       }
+
+#if RMW_VERSION_GTE(0, 8, 2)
+    case RMW_EVENT_OFFERED_QOS_INCOMPATIBLE: {
+        auto ei = static_cast<rmw_offered_qos_incompatible_event_status_t *>(event_info);
+        auto pub = static_cast<CddsPublisher *>(event_handle->data);
+        dds_offered_incompatible_qos_status_t st;
+        if (dds_get_offered_incompatible_qos_status(pub->enth, &st) < 0) {
+          *taken = false;
+          return RMW_RET_ERROR;
+        } else {
+          ei->total_count = static_cast<int32_t>(st.total_count);
+          ei->total_count_change = st.total_count_change;
+          ei->last_policy_kind = dds_qos_policy_to_rmw_qos_policy(
+            static_cast<dds_qos_policy_id_t>(st.last_policy_id));
+          *taken = true;
+          return RMW_RET_OK;
+        }
+      }
+#endif
 
     case RMW_EVENT_INVALID: {
         break;
@@ -2107,24 +2351,6 @@ static void clean_waitset_caches()
       waitset_detach(ws);
     }
   }
-}
-
-/// mapping of RMW_EVENT to the corresponding DDS status
-static const std::unordered_map<rmw_event_type_t, uint32_t> mask_map{
-  {RMW_EVENT_LIVELINESS_CHANGED, DDS_LIVELINESS_CHANGED_STATUS},
-  {RMW_EVENT_REQUESTED_DEADLINE_MISSED, DDS_REQUESTED_DEADLINE_MISSED_STATUS},
-  {RMW_EVENT_LIVELINESS_LOST, DDS_LIVELINESS_LOST_STATUS},
-  {RMW_EVENT_OFFERED_DEADLINE_MISSED, DDS_OFFERED_DEADLINE_MISSED_STATUS},
-};
-
-static uint32_t get_status_kind_from_rmw(const rmw_event_type_t event_t)
-{
-  return mask_map.at(event_t);
-}
-
-static bool is_event_supported(const rmw_event_type_t event_t)
-{
-  return mask_map.count(event_t) > 0;
 }
 
 static rmw_ret_t gather_event_entities(
@@ -2368,9 +2594,8 @@ extern "C" rmw_ret_t rmw_take_response(
     dds_time_t dtreq = tnow - info->reqtime[seq];
     if (dtreq > DDS_MSECS(REPORT_LATE_MESSAGES) || dtresp > DDS_MSECS(REPORT_LATE_MESSAGES)) {
       fprintf(
-        stderr, "** %s response time %.fms; response in history for %.fms\n",
-        info->client.sub->sertopic->name, static_cast<double>(dtreq) / 1e6,
-        static_cast<double>(dtresp) / 1e6);
+        stderr, "** response time %.fms; response in history for %.fms\n",
+        static_cast<double>(dtreq) / 1e6, static_cast<double>(dtresp) / 1e6);
     }
     info->reqtime.erase(seq);
   }
@@ -2388,9 +2613,7 @@ static void check_for_blocked_requests(CddsClient & client)
     for (auto const & r : client.reqtime) {
       dds_time_t dt = tnow - r.second;
       if (dt > DDS_SECS(1)) {
-        fprintf(
-          stderr, "** %s already waiting for %.fms\n", client.client.sub->sertopic->name,
-          static_cast<double>(dt) / 1e6);
+        fprintf(stderr, "** already waiting for %.fms\n", static_cast<double>(dt) / 1e6);
       }
     }
   }
@@ -2532,27 +2755,27 @@ static rmw_ret_t rmw_init_cs(
   RCUTILS_LOG_DEBUG_NAMED("rmw_cyclonedds_cpp", "***********");
 
   dds_entity_t pubtopic, subtopic;
+  struct sertopic_rmw * pub_st, * sub_st;
 
-  auto pub_st = create_sertopic(
+  pub_st = create_sertopic(
     pubtopic_name.c_str(), type_support->typesupport_identifier, pub_type_support, true,
     std::move(pub_msg_ts));
-  auto sub_st = create_sertopic(
-    subtopic_name.c_str(), type_support->typesupport_identifier, sub_type_support, true,
-    std::move(sub_msg_ts));
-
-  dds_qos_t * qos;
-  if ((pubtopic =
-    dds_create_topic_arbitrary(node_impl->enth, pub_st, nullptr, nullptr, nullptr)) < 0)
-  {
+  struct ddsi_sertopic * pub_stact;
+  pubtopic = create_topic(node_impl->enth, pub_st, &pub_stact);
+  if (pubtopic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_pubtopic;
   }
-  if ((subtopic =
-    dds_create_topic_arbitrary(node_impl->enth, sub_st, nullptr, nullptr, nullptr)) < 0)
-  {
+
+  sub_st = create_sertopic(
+    subtopic_name.c_str(), type_support->typesupport_identifier, sub_type_support, true,
+    std::move(sub_msg_ts));
+  subtopic = create_topic(node_impl->enth, sub_st);
+  if (subtopic < 0) {
     RMW_SET_ERROR_MSG("failed to create topic");
     goto fail_subtopic;
   }
+  dds_qos_t * qos;
   if ((qos = dds_create_qos()) == nullptr) {
     goto fail_qos;
   }
@@ -2562,12 +2785,11 @@ static rmw_ret_t rmw_init_cs(
     RMW_SET_ERROR_MSG("failed to create writer");
     goto fail_writer;
   }
-  pub->sertopic = pub_st;
+  pub->sertopic = pub_stact;
   if ((sub->enth = dds_create_reader(node_impl->sub, subtopic, qos, nullptr)) < 0) {
     RMW_SET_ERROR_MSG("failed to create reader");
     goto fail_reader;
   }
-  sub->sertopic = sub_st;
   if ((sub->rdcondh = dds_create_readcondition(sub->enth, DDS_ANY_STATE)) < 0) {
     RMW_SET_ERROR_MSG("failed to create readcondition");
     goto fail_readcond;
@@ -2596,14 +2818,18 @@ fail_qos:
   dds_delete(subtopic);
 fail_subtopic:
   dds_delete(pubtopic);
+#ifndef DDS_HAS_CREATE_TOPIC_GENERIC
+  ddsi_sertopic_unref(pub_stact);
+#endif
 fail_pubtopic:
   return RMW_RET_ERROR;
 }
 
 static void rmw_fini_cs(CddsCS * cs)
 {
-  ddsi_sertopic_unref(cs->sub->sertopic);
+#ifndef DDS_HAS_CREATE_TOPIC_GENERIC
   ddsi_sertopic_unref(cs->pub->sertopic);
+#endif
   dds_delete(cs->sub->rdcondh);
   dds_delete(cs->sub->enth);
   dds_delete(cs->pub->enth);
@@ -2815,27 +3041,31 @@ static rmw_ret_t do_for_node_user_data(
   return do_for_node(node_impl, f);
 }
 
-extern "C" rmw_ret_t rmw_get_node_names(
+extern "C" rmw_ret_t rmw_get_node_names_impl(
   const rmw_node_t * node,
   rcutils_string_array_t * node_names,
-  rcutils_string_array_t * node_namespaces)
+  rcutils_string_array_t * node_namespaces,
+  rcutils_string_array_t * security_contexts)
 {
   RET_WRONG_IMPLID(node);
   auto node_impl = static_cast<CddsNode *>(node->data);
-  if (rmw_check_zero_rmw_string_array(node_names) != RMW_RET_OK ||
-    rmw_check_zero_rmw_string_array(node_namespaces) != RMW_RET_OK)
+  if (RMW_RET_OK != rmw_check_zero_rmw_string_array(node_names) ||
+    RMW_RET_OK != rmw_check_zero_rmw_string_array(node_namespaces))
   {
     return RMW_RET_ERROR;
   }
 
-  std::set<std::pair<std::string, std::string>> ns;
-  const auto re = std::regex("^name=(.*);namespace=(.*);$", std::regex::extended);
+  std::regex re {
+    "^name=([^;]*);namespace=([^;]*);(securitycontext=([^;]*);)?",
+    std::regex_constants::extended
+  };
+  std::vector<std::tuple<std::string, std::string, std::string>> ns;
   auto oper =
     [&ns, re](const dds_builtintopic_participant_t & sample, const char * ud) -> bool {
       std::cmatch cm;
       static_cast<void>(sample);
       if (std::regex_search(ud, cm, re)) {
-        ns.insert(std::make_pair(std::string(cm[1]), std::string(cm[2])));
+        ns.push_back(std::make_tuple(std::string(cm[1]), std::string(cm[2]), std::string(cm[4])));
       }
       return true;
     };
@@ -2851,16 +3081,30 @@ extern "C" rmw_ret_t rmw_get_node_names(
     RMW_SET_ERROR_MSG(rcutils_get_error_string().str);
     goto fail_alloc;
   }
-  size_t i;
-  i = 0;
-  for (auto && n : ns) {
-    node_names->data[i] = rcutils_strdup(n.first.c_str(), allocator);
-    node_namespaces->data[i] = rcutils_strdup(n.second.c_str(), allocator);
-    if (!node_names->data[i] || !node_namespaces->data[i]) {
-      RMW_SET_ERROR_MSG("rmw_get_node_names for name/namespace");
-      goto fail_alloc;
+  if (security_contexts &&
+    rcutils_string_array_init(security_contexts, ns.size(), &allocator) != RCUTILS_RET_OK)
+  {
+    RMW_SET_ERROR_MSG(rcutils_get_error_string().str);
+    goto fail_alloc;
+  }
+  {
+    size_t i = 0;
+    for (auto & n : ns) {
+      node_names->data[i] = rcutils_strdup(std::get<0>(n).c_str(), allocator);
+      node_namespaces->data[i] = rcutils_strdup(std::get<1>(n).c_str(), allocator);
+      if (!node_names->data[i] || !node_namespaces->data[i]) {
+        RMW_SET_ERROR_MSG("rmw_get_node_names for name/namespace");
+        goto fail_alloc;
+      }
+      if (security_contexts) {
+        security_contexts->data[i] = rcutils_strdup(std::get<2>(n).c_str(), allocator);
+        if (!security_contexts->data[i]) {
+          RMW_SET_ERROR_MSG("rmw_get_node_names for security_context");
+          goto fail_alloc;
+        }
+      }
+      i++;
     }
-    i++;
   }
   return RMW_RET_OK;
 
@@ -2881,8 +3125,46 @@ fail_alloc:
       rcutils_reset_error();
     }
   }
+  if (security_contexts) {
+    if (rcutils_string_array_fini(security_contexts) != RCUTILS_RET_OK) {
+      RCUTILS_LOG_ERROR_NAMED(
+        "rmw_cyclonedds_cpp",
+        "failed to cleanup during error handling: %s", rcutils_get_error_string().str);
+      rcutils_reset_error();
+    }
+  }
   return RMW_RET_BAD_ALLOC;
 }
+
+extern "C" rmw_ret_t rmw_get_node_names(
+  const rmw_node_t * node,
+  rcutils_string_array_t * node_names,
+  rcutils_string_array_t * node_namespaces)
+{
+  return rmw_get_node_names_impl(
+    node,
+    node_names,
+    node_namespaces,
+    nullptr);
+}
+
+#if RMW_VERSION_GTE(0, 8, 2)
+extern "C" rmw_ret_t rmw_get_node_names_with_security_contexts(
+  const rmw_node_t * node,
+  rcutils_string_array_t * node_names,
+  rcutils_string_array_t * node_namespaces,
+  rcutils_string_array_t * security_contexts)
+{
+  if (RMW_RET_OK != rmw_check_zero_rmw_string_array(security_contexts)) {
+    return RMW_RET_ERROR;
+  }
+  return rmw_get_node_names_impl(
+    node,
+    node_names,
+    node_namespaces,
+    security_contexts);
+}
+#endif
 
 static rmw_ret_t rmw_collect_data_for_endpoint(
   CddsNode * node_impl,
@@ -2937,7 +3219,7 @@ static void get_node_name(
 {
   static_cast<void>(pp_guid);  // only used in assert()
   bool node_found = false;
-  const auto re_ud = std::regex("^name=(.*);namespace=(.*);$", std::regex::extended);
+  const auto re_ud = std::regex("^name=([^;]*);namespace=([^;]*);", std::regex::extended);
   size_t udsz;
   dds_sample_info_t info;
   void * msg = NULL;
@@ -3189,10 +3471,10 @@ static rmw_ret_t get_node_guids(
   const char * node_name, const char * node_namespace,
   std::set<dds_builtintopic_guid_t> & guids)
 {
-  std::string needle = get_node_user_data(node_name, node_namespace);
+  std::string needle = get_node_user_data_name_ns(node_name, node_namespace);
   auto oper =
     [&guids, needle](const dds_builtintopic_participant_t & sample, const char * ud) -> bool {
-      if (std::string(ud) == needle) {
+      if (0u == std::string(ud).find(needle)) {
         guids.insert(sample.key);
       }
       return true;               /* do keep looking - what if there are many? */
